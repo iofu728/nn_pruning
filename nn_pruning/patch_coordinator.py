@@ -26,17 +26,53 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 from nn_pruning.model_structure import struct_from_config, ModelStructureNotFound
+import os
 
-from .modules.masked_nn import (
-    ChannelPruningModulePatcher,
-    JointPruningModulePatcher,
-    LinearPruningModulePatcher,
-    LinearPruningArgs,
-    MaskedLinear,
-    MaskedLinearModelCompiler,
-    GenericLinearPruningContextModule,
-    head_mask,
-)
+if os.environ.get('PIT_METHOD') == 'PyTorch':
+    from .modules.masked_nn import (
+        ChannelPruningModulePatcher,
+        JointPruningModulePatcher,
+        LinearPruningModulePatcher,
+        LinearPruningArgs,
+        MaskedLinear,
+        MaskedLinearModelCompiler,
+        GenericLinearPruningContextModule,
+        head_mask,
+    )
+elif os.environ.get('PIT_METHOD') == 'PyTorch-S':
+    from .modules.masked_nn_triton import (
+        ChannelPruningModulePatcher,
+        JointPruningModulePatcher,
+        LinearPruningModulePatcher,
+        LinearPruningArgs,
+        MaskedLinear,
+        MaskedLinearModelCompiler,
+        GenericLinearPruningContextModule,
+        head_mask,
+    )
+elif os.environ.get('PIT_METHOD') == 'PIT':
+    from .modules.masked_nn_pit import (
+        ChannelPruningModulePatcher,
+        JointPruningModulePatcher,
+        LinearPruningModulePatcher,
+        LinearPruningArgs,
+        MaskedLinear,
+        MaskedLinearModelCompiler,
+        GenericLinearPruningContextModule,
+        head_mask,
+    )
+elif os.environ.get('PIT_METHOD') == 'PIT_32x1':
+    from .modules.masked_nn_pit_32x1 import (
+        ChannelPruningModulePatcher,
+        JointPruningModulePatcher,
+        LinearPruningModulePatcher,
+        LinearPruningArgs,
+        MaskedLinear,
+        MaskedLinearModelCompiler,
+        GenericLinearPruningContextModule,
+        head_mask,
+    )
+
 from .modules.nonorm import Layer2NoNorm, NoNorm, NoNormCompiler, Layer2NoNormPatcher
 from .modules.gelu2relu import GeLU2ReLUModelPatcher
 from .inference_model_patcher import BertHeadsPruner

@@ -49,6 +49,9 @@ AMPERE_N = 2
 
 import torch.distributions
 from functools import lru_cache
+from sparta.opset.blockwise_dynamic_sparse_linear import BlockwiseSparseLinear
+from sparta.opset.blockwise_dynamic_sparse_linear_condense import BlockwiseSparseLinearCondense
+from sparta.opset.dim_dynamic_sparse_linear import DimDynamicLinear
 
 @dataclass
 class RuntimeLinearPruningArgs:
@@ -287,14 +290,16 @@ class MaskModule(nn.Module):
         submethod = args.submethod
         if submethod.startswith("1d"):
             dividers = args.block_rows, args.block_cols
-            for i, m in enumerate(mask_scores):
-                if m is None:
-                    assert submethod == "1d_alt"
-                    mask_scores[i] = torch.ones(weight.shape[i] // dividers[i], device=weight.device)
+            mask_scores = mask_scores[1] if mask_scores[0] is None else mask_scores[0]
+            # for i, m in enumerate(mask_scores):
+            #     if m is None:
+            #         assert submethod == "1d_alt"
+            #         mask_scores[i] = torch.ones(weight.shape[i] // dividers[i], device=weight.device)
 
-            mask_scores = mask_scores[0].unsqueeze(-1).matmul(mask_scores[1].unsqueeze(0))
+            # mask_scores = mask_scores[0]
+            # mask_scores = mask_scores[0].unsqueeze(-1).matmul(mask_scores[1].unsqueeze(0))
         else:
-            mask_scores = mask_scores[0] if mask_scores is not None else mask_scores
+            mask_scores = mask_scores if mask_scores is None else mask_scores[0]
 
         if method == "topK":
             mask = TopKBinarizer.apply(mask_scores, threshold)
@@ -318,13 +323,13 @@ class MaskModule(nn.Module):
         else:
             raise NotImplementedError(f"Unknown method {method}")
 
-        if True:
-            # Expand block mask to individual element mask
-            mask = MaskModule.expand_mask(
-                mask,
-                block_rows=args.block_rows,
-                block_cols=args.block_cols,
-            )
+        # if method not in "magnitude":
+        #     # Expand block mask to individual element mask
+        #     mask = MaskModule.expand_mask(
+        #         mask,
+        #         block_rows=args.block_rows,
+        #         block_cols=args.block_cols,
+        #     )
 
         return mask
 
@@ -344,13 +349,22 @@ class MaskedLinear(ReplacementModule):
         ampere_context_module: AmpereLinearPruningContextModule,
         args: LinearPruningArgs,
         row_additive_mask: Optional[torch.Tensor]=None,
-        col_additive_mask: Optional[torch.Tensor]=None
+        col_additive_mask: Optional[torch.Tensor]=None,
+        child_module_name=None
     ):
         super().__init__()
 
+        device = linear_module.weight.device
         assert isinstance(linear_module, nn.Linear)
         self.weight = linear_module.weight
         self.bias = linear_module.bias
+        # print(child_module_name, args, linear_module)
+        if args.submethod.startswith("1d"):
+            self.sparse = DimDynamicLinear(linear_module.cuda(), 0 if "intermediate" in child_module_name else 1)
+        else:
+            self.sparse = BlockwiseSparseLinearCondense(linear_module.cuda(), 1, 32)
+        del linear_module
+        torch.cuda.empty_cache()
 
         self.mask_module = MaskModule(mask_context_modules, args)
         if ampere_context_module is not None:
@@ -358,18 +372,18 @@ class MaskedLinear(ReplacementModule):
         self.args = args
 
         if row_additive_mask is not None:
-            row_additive_mask = row_additive_mask.to(self.weight.device)
+            row_additive_mask = row_additive_mask.to(device)
         self.row_additive_mask = row_additive_mask
 
         if col_additive_mask is not None:
-            col_additive_mask = col_additive_mask.to(self.weight.device)
+            col_additive_mask = col_additive_mask.to(device)
 
         self.col_additive_mask = col_additive_mask
 
     def nnz(self, m):
         return int((m != 0).sum().item())
 
-    def get_masked_weights_bias(self):
+    def get_masked_scores(self):
         threshold = self.get_context_data("threshold")
         mask = self.mask_module(self.weight, threshold)
 
@@ -401,20 +415,15 @@ class MaskedLinear(ReplacementModule):
                 mask = ampere_mask
             self.base_mask_nnz = self.mask_nnz
             self.mask_nnz = self.nnz(mask)
+        # print(mask)
+        return mask.to(torch.int)
 
-        if mask is not None:
-            masked_weights = mask * self.weight
-        else:
-            masked_weights = self.weight
-
-        bias = self.bias
-        if bias is not None:
-            if self.args.bias_mask and mask is not None:
-                bias = bias * (mask != 0).any(1)
-
-        return masked_weights, bias
-
-    def forward(self, input):
+    def forward(self, input, mask=None):
+        if mask is None:
+            mask = self.get_masked_scores()
+        # print(input.shape, mask.shape, mask.sum(-1))
+        # print(input.shape, mask.shape)
+        return self.sparse(input, mask.T)
         masked_weights, bias = self.get_masked_weights_bias()
         # Compute output (linear layer) with masked weights
         return F.linear(input, masked_weights, bias)
@@ -525,7 +534,7 @@ class LinearPruningModulePatcher(ModulePatcher):
 
         return MaskedLinear(child_module, mask_context_modules, ampere_context_module, self.args,
                             row_additive_mask = row_additive_mask,
-                            col_additive_mask = col_additive_mask)
+                            col_additive_mask = col_additive_mask, child_module_name=child_module_name)
 
 
 class JointPruningModulePatcher(LinearPruningModulePatcher):

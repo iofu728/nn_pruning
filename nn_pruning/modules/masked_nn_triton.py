@@ -41,6 +41,8 @@ from nn_pruning.training_patcher import (
 
 from .binarizer import MagnitudeBinarizer, ThresholdBinarizer, TopKBinarizer
 import numpy
+from sparta.opset.triton_dynamic_sparse_linear import TritonDynamicLinear
+from torch.autograd import Variable
 
 sparse_patterns = None
 
@@ -265,6 +267,7 @@ class MaskModule(nn.Module):
         assert isinstance(context_modules, (list, tuple))
         self.context_modules = nn.ModuleList(context_modules)
         self.args = args
+        self.mask_scores = None
 
     @staticmethod
     def expand_mask(mask, block_rows, block_cols):
@@ -295,6 +298,8 @@ class MaskModule(nn.Module):
             mask_scores = mask_scores[0].unsqueeze(-1).matmul(mask_scores[1].unsqueeze(0))
         else:
             mask_scores = mask_scores[0] if mask_scores is not None else mask_scores
+
+        # mask_scores = mask_scores + Variable(torch.bernoulli(torch.Tensor(mask_scores.size()).uniform_(0, 1))).cuda() * 10e-7
 
         if method == "topK":
             mask = TopKBinarizer.apply(mask_scores, threshold)
@@ -332,7 +337,6 @@ class MaskModule(nn.Module):
         mask_scores = None
         if self.args.method != "magnitude":
             mask_scores = [(c.mask_scores if c is not None else None) for c in self.context_modules]
-
         return self.mask(weight, mask_scores, self.args, threshold, self.training)
 
 
@@ -365,6 +369,8 @@ class MaskedLinear(ReplacementModule):
             col_additive_mask = col_additive_mask.to(self.weight.device)
 
         self.col_additive_mask = col_additive_mask
+        self.triton = TritonDynamicLinear(linear_module.cuda(), 32, 32, profile=True)
+        self.mask = None
 
     def nnz(self, m):
         return int((m != 0).sum().item())
@@ -401,6 +407,7 @@ class MaskedLinear(ReplacementModule):
                 mask = ampere_mask
             self.base_mask_nnz = self.mask_nnz
             self.mask_nnz = self.nnz(mask)
+        return mask
 
         if mask is not None:
             masked_weights = mask * self.weight
@@ -415,7 +422,13 @@ class MaskedLinear(ReplacementModule):
         return masked_weights, bias
 
     def forward(self, input):
-        masked_weights, bias = self.get_masked_weights_bias()
+        mask = self.get_masked_weights_bias()
+        # if self.mask is not None:
+        #     print((mask - self.mask).abs().sum()/ (mask.shape[0] * mask.shape[1]))
+        # self.mask = mask
+        # print(mask.shape)print(mask.sum()/(mask.shape[0] * mask.shape[1]))
+        # print(mask.sum(-1))
+        return self.triton(input, mask)
         # Compute output (linear layer) with masked weights
         return F.linear(input, masked_weights, bias)
 
